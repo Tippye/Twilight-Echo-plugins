@@ -40,3 +40,16 @@ test('rejects lossy offsets and invalid resource sizes', () => {
   assert.throws(() => new WindowsMediaStream(Buffer.alloc(0)), RangeError)
   assert.throws(() => new WindowsMediaStream(Buffer.alloc(8193)), RangeError)
 })
+
+test('revoking a stream prevents later transforms without altering caller buffers', () => {
+  for (const size of [16, 512]) {
+    const key = Buffer.alloc(size, 7)
+    const cipher = new WindowsMediaStream(key)
+    cipher.dispose()
+    cipher.dispose()
+    const data = Buffer.alloc(64, 9)
+    assert.throws(() => cipher.transform(data, '0'), /closed/)
+    assert.ok(data.every(value => value === 9))
+    assert.ok(key.every(value => value === 7))
+  }
+})

@@ -22,6 +22,7 @@ export class WindowsMediaStream {
   #key
   #state
   #hash = 1
+  #closed = false
 
   constructor(key) {
     if (!(key instanceof Uint8Array)) throw new TypeError('media key must be bytes')
@@ -48,6 +49,7 @@ export class WindowsMediaStream {
   }
 
   transform(buffer, absoluteOffset) {
+    if (this.#closed) throw new Error('media stream is closed')
     if (!(buffer instanceof Uint8Array)) throw new TypeError('media buffer must be bytes')
     if (buffer.byteLength > 0x7fffffff) throw new RangeError('media buffer exceeds native signed length')
     let position = offset(absoluteOffset)
@@ -125,7 +127,17 @@ export class WindowsMediaStream {
         state[j] = previous
         if (step >= span.skip) buffer[span.index + step - span.skip] ^= state[(state[i] + state[j]) % size]
       }
+      state.fill(0)
     }
     return buffer
+  }
+
+  /** Clear owned byte buffers when a source is revoked; JS does not guarantee secure erasure. */
+  dispose() {
+    if (this.#closed) return
+    this.#closed = true
+    this.#key.fill(0)
+    this.#state?.fill(0)
+    this.#hash = 0
   }
 }
