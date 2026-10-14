@@ -50,6 +50,14 @@ function deferred() {
   const promise = new Promise((done) => { resolve = done })
   return { promise, resolve }
 }
+async function within(promise, milliseconds, message) {
+  let timer
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(Error(message)), milliseconds)
+    })])
+  } finally { clearTimeout(timer) }
+}
 
 test('loopback leases use opaque paths and expose logical bytes, GET, HEAD and byte ranges', async (t) => {
   const proxy = await harness(t)
@@ -425,6 +433,7 @@ test('downstream pause across the upstream-wait timeout can resume and finish th
   const length = String(chunks * chunkBytes)
   let pulled = 0
   let disposed = 0
+  const requestDisposed = deferred()
   const proxy = await harness(t, { requestTimeoutMs: 50, fetch: () => new Response(new ReadableStream({
     pull(controller) {
       pulled += 1
@@ -434,7 +443,7 @@ test('downstream pause across the upstream-wait timeout can resume and finish th
   }), { status: 206, headers: { 'Content-Range': `bytes 0-${BigInt(length) - 1n}/${length}` } }) })
   const lease = await proxy.open({ resolve: () => source({ upstreamLength: length,
     decoder: { kind: 'mode1', length, tailBytes: '0', transform: (bytes) => bytes,
-      dispose() { disposed += 1 } } }) })
+      dispose() { disposed += 1; if (disposed === 2) requestDisposed.resolve() } } }) })
   const { req, response } = await rawRequest(lease.url, { consume: false })
   t.after(() => { response.destroy(); req.destroy() })
   let received = 0
@@ -451,6 +460,8 @@ test('downstream pause across the upstream-wait timeout can resume and finish th
   response.resume()
   await finished
   assert.equal(received, Number(length))
+  // Client 'end' can arrive before the server finishes its owner's finally block.
+  await within(requestDisposed.promise, 1000, 'completed request must dispose its decoder owner')
   assert.equal(disposed, 2)
 })
 

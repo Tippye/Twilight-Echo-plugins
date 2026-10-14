@@ -242,12 +242,19 @@ export class WindowsMusicClient {
   async #commit(session, epoch, expected, device, verified, signal) {
     return this.#enqueue(async () => {
       this.#assert(epoch, signal)
+      const previous = await this.#settings.get(WINDOWS_AUTH_KEY)
+      this.#assert(epoch, signal)
       if (expected !== undefined) {
-        const current = normalizedSession(await this.#settings.get(WINDOWS_AUTH_KEY))
-        this.#assert(epoch, signal)
+        const current = normalizedSession(previous)
         if (fingerprint(current) !== expected) throw abortError()
       }
       await this.#settings.set(WINDOWS_AUTH_KEY, { ...session })
+      if (this.#closed || epoch !== this.#epoch || signal?.aborted) {
+        // A settings write already started cannot be aborted. Restore its predecessor
+        // inside the same queue before a replacement login or logout can write.
+        if (previous === undefined) await this.#settings.delete(WINDOWS_AUTH_KEY)
+        else await this.#settings.set(WINDOWS_AUTH_KEY, previous)
+      }
       this.#assert(epoch, signal)
       this.#verified = verified ? { session: fingerprint(session), guid: device.guid,
         at: this.#time() } : null
@@ -447,6 +454,13 @@ export class WindowsMusicClient {
   async logout() {
     this.#advance()
     await this.#enqueue(() => this.#settings.delete(WINDOWS_AUTH_KEY))
+  }
+
+  /** Invalidate pending requests while retaining the session from before their writes. */
+  async cancelPending() {
+    this.#assert(this.#epoch)
+    this.#advance()
+    await this.#writes
   }
 
   close() {

@@ -307,3 +307,28 @@ test('session changes and unsupported login modes cannot be committed by a stale
   assert.equal(await unsupported.client.refreshMusicKey(), false)
   unsupported.client.close()
 })
+
+test('replacing authorization cancels an already-started storage write and restores its predecessor', async () => {
+  for (const previous of [undefined, publicSession]) {
+    const entered = deferred()
+    const release = deferred()
+    const values = new Map(previous ? [[WINDOWS_AUTH_KEY, copy(previous)]] : [])
+    let sets = 0
+    const h = harness({ fetch: () => response(key, { ...publicSession, musickey: 'public-obsolete-key' }), settings: {
+      async get(name) { return copy(values.get(name)) },
+      async set(name, value) {
+        if (++sets === 1) { entered.resolve(); await release.promise }
+        values.set(name, copy(value))
+      },
+      async delete(name) { values.delete(name) }
+    } })
+    const login = h.client.loginWithQQCode('public-old-code')
+    const rejected = assert.rejects(login, { name: 'AbortError' })
+    await entered.promise
+    const cancelled = h.client.cancelPending()
+    release.resolve()
+    await Promise.all([cancelled, rejected])
+    assert.deepEqual(values.get(WINDOWS_AUTH_KEY), previous)
+    h.client.close()
+  }
+})
