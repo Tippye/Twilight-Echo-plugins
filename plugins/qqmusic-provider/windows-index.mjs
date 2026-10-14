@@ -19,7 +19,7 @@ import { buildWindowsUserPlaylistsCall, WINDOWS_USER_PLAYLISTS_REQUEST_KEY,
 import { decodeWindowsCreatedPlaylists, decodeWindowsFavoritePlaylists,
   decodeWindowsPlaylistDetail, windowsPlaylistReference } from './lib/windows/playlist-data.mjs'
 import { serializeWindowsSettings, windowsPlaybackQuality, windowsQualityForm, saveWindowsQuality,
-  WINDOWS_QUALITY_COMMAND } from './lib/windows/settings.mjs'
+  windowsQualityState, setWindowsPlaybackQuality, WINDOWS_QUALITY_COMMAND } from './lib/windows/settings.mjs'
 
 let active = null
 
@@ -40,6 +40,14 @@ export async function activate(context) {
     const invocation = args.pop()
     return fn(state, args, invocation)
   }
+  const qualityGuard = invocation => () => {
+    if (state.closed) throw new Error('QQ 音乐音源已停用')
+    if (invocation?.signal?.aborted) {
+      const error = new Error('QQ 音乐音质设置已取消')
+      error.name = 'AbortError'
+      throw error
+    }
+  }
   await context.twilight.providers.register({
     id: 'qq', name: 'QQ 音乐', capabilities: ['search', 'playbackUrl', 'lyrics', 'cover', 'login', 'playlist', 'library'],
     ui: { icon: 'pi pi-music', color: '#31c27c', description: 'QQ 音乐曲库', authType: 'qr',
@@ -57,6 +65,10 @@ export async function activate(context) {
     searchSongs: handler(searchSongs), checkLogin: handler(checkLogin), getProfile: handler(getProfile),
     logout: handler(logout), getQrLogin: handler(getQrLogin), checkQrLogin: handler(checkQrLogin),
     getPlaybackUrl: handler(getPlaybackUrl), getLyrics: handler(getLyrics),
+    getPlaybackQuality: handler((s, _args, invocation) => windowsQualityState(s.settings,
+      { guard: qualityGuard(invocation) })),
+    setPlaybackQuality: handler((s, args, invocation) => setWindowsPlaybackQuality(s.settings, args[0],
+      { guard: qualityGuard(invocation) })),
     fetchUserLibrary: handler(fetchUserLibrary), fetchPlaylistTracks: handler(fetchPlaylistTracks),
     fetchAlbumTracks: handler((s, args, invocation) => fetchWindowsAlbumTracks({
       client: s.client, album: args[0], signal: invocation?.signal })),
@@ -77,9 +89,10 @@ export async function activate(context) {
   })
   await context.twilight.ui.register({ id: 'qqmusic-windows-quality', kind: 'settingsPanel',
     title: 'QQ 音乐播放音质', description: 'MP3、FLAC、Hi-Res、杜比全景声与 5.1 品质', command: WINDOWS_QUALITY_COMMAND })
-  context.twilight.ui.onCommand(WINDOWS_QUALITY_COMMAND, async values => {
+  context.twilight.ui.onCommand(WINDOWS_QUALITY_COMMAND, async (values, invocation) => {
     if (state.closed) throw new Error('QQ 音乐音源已停用')
-    return values?.source === 'settingsPanel' ? windowsQualityForm(state.settings) : saveWindowsQuality(state.settings, values)
+    const options = { guard: qualityGuard(invocation) }
+    return values?.source === 'settingsPanel' ? windowsQualityForm(state.settings, options) : saveWindowsQuality(state.settings, values, options)
   })
 }
 

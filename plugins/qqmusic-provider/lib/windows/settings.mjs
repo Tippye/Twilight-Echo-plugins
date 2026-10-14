@@ -15,30 +15,57 @@ export function serializeWindowsSettings(settings) {
     return result
   }
   // A host read may migrate legacy sensitive values and write the same file.
-  const owner = { get: key => mutate(() => settings.get(key)),
-    set: (key, value) => mutate(() => settings.set(key, value)),
+  const owner = { get: (key, guard) => mutate(() => { guard?.(); return settings.get(key) }),
+    set: (key, value, guard) => mutate(() => { guard?.(); return settings.set(key, value) }),
     delete: key => mutate(() => settings.delete(key)) }
   owners.set(settings, owner)
+  owners.set(owner, owner)
   return owner
 }
 
-export async function windowsPlaybackQuality(settings) {
-  const stored = await settings.get(WINDOWS_QUALITY_KEY)
+export async function windowsPlaybackQuality(settings, { guard } = {}) {
+  guard?.()
+  const stored = await serializeWindowsSettings(settings).get(WINDOWS_QUALITY_KEY, guard)
+  guard?.()
   if (stored === undefined || stored === null) return '128'
   if (!OPTIONS.some(option => option.value === stored)) throw new Error('QQ 音乐音质设置无效')
   return stored
 }
 
-export async function windowsQualityForm(settings) {
-  return { kind: 'settings-form', submitCommand: WINDOWS_QUALITY_COMMAND,
-    notice: '选择 QQ 音乐播放音质。保存后切换歌曲应用；所选音质需要歌曲和账号支持。',
-    fields: [{ key: 'quality', label: '播放音质', type: 'select', required: true,
-      value: await windowsPlaybackQuality(settings), options: OPTIONS }] }
+export async function windowsQualityState(settings, options) {
+  const quality = await windowsPlaybackQuality(settings, options)
+  options?.guard?.()
+  return { quality, options: OPTIONS }
 }
 
-export async function saveWindowsQuality(settings, values) {
-  if (!values || typeof values !== 'object' || Array.isArray(values) ||
-      !OPTIONS.some(option => option.value === values.quality)) throw new Error('请选择有效的 QQ 音乐音质')
-  await settings.set(WINDOWS_QUALITY_KEY, values.quality)
-  return { message: '音质已保存。切换歌曲后应用所选音质。', form: await windowsQualityForm(settings) }
+export async function setWindowsPlaybackQuality(settings, quality, { guard } = {}) {
+  if (typeof quality !== 'string' || !OPTIONS.some(option => option.value === quality)) {
+    throw new Error('请选择有效的 QQ 音乐音质')
+  }
+  guard?.()
+  await serializeWindowsSettings(settings).set(WINDOWS_QUALITY_KEY, quality, guard)
+  guard?.()
+  // Return this committed selection without another queued read that could
+  // observe a later concurrent selection. The player owns applying it to a stream.
+  return { quality, options: OPTIONS }
+}
+
+function qualityForm(state) {
+  return { kind: 'settings-form', submitCommand: WINDOWS_QUALITY_COMMAND,
+    notice: '播放器可立即切换音质；在设置页保存后，下次播放应用。所选音质需要歌曲和账号支持。',
+    fields: [{ key: 'quality', label: '播放音质', type: 'select', required: true,
+      value: state.quality, options: state.options }] }
+}
+
+export async function windowsQualityForm(settings, options) {
+  const state = await windowsQualityState(settings, options)
+  options?.guard?.()
+  return qualityForm(state)
+}
+
+export async function saveWindowsQuality(settings, values, options) {
+  if (!values || typeof values !== 'object' || Array.isArray(values)) throw new Error('请选择有效的 QQ 音乐音质')
+  const state = await setWindowsPlaybackQuality(settings, values.quality, options)
+  options?.guard?.()
+  return { message: '音质已保存，下次播放应用。可在播放器切换当前歌曲音质。', form: qualityForm(state) }
 }
