@@ -71,7 +71,7 @@ export function buildWindowsComm({ uin, versionMain, versionSub, wid,
   return result
 }
 
-/** The exact metadata format at 0x100737a8; accountIdentity's source is unresolved. */
+/** 0x100737a8 metadata; CAFcf musicid -> payload+70 -> OnLogin globals55f8/fc. */
 export function buildWindowsSignatureMetadata({ fullVersion, accountIdentity, unixTime, guid } = {}) {
   return Buffer.from(`19&${integer(fullVersion, 'fullVersion', true)}&&${windowsUnsigned64(accountIdentity, 'accountIdentity')}&${nativeSigned64(unixTime).rawJSON}&${string(guid, 'guid')}&`, 'utf8')
 }

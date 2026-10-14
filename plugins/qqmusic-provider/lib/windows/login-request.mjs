@@ -2,6 +2,16 @@ import { nativeSigned64 } from './json-integer.mjs'
 
 export const WINDOWS_LOGIN_REQUEST_KEY = 'music.login.LoginServer.Login'
 export const WINDOWS_LOGIN_DEFAULT_APPID = 100497308
+export const WINDOWS_QQ_TOKEN_REFRESH_REQUEST_KEY = 'QQRefreshToken'
+export const WINDOWS_QQ_MUSIC_KEY_REFRESH_REQUEST_KEY = 'QQRefreshKey'
+export const WINDOWS_QQ_REFRESH_PROVENANCE = Object.freeze({
+  artifact: 'QQMusic_Protocol.dll',
+  artifactSha256: 'ba66aa248b885227179f1676fbc54576a036f46b9d096fea33131c4f30fa6476',
+  tokenProducer: '0x100c95f7',
+  tokenEvidenceId: 'ev_c8c3cbc728ed8c26477f6aeac90d01b98029a82575ea203688dddd826cf2ea2e',
+  musicKeyProducer: '0x100c928b',
+  musicKeyEvidenceId: 'ev_60c072818979457ee417e5edc2d019fa53417938e2eae2b6415bfa2151051142'
+})
 export const WINDOWS_LOGIN_REQUEST_PROVENANCE = Object.freeze({
   artifact: 'QQMusic_Protocol.dll',
   artifactSha256: 'ba66aa248b885227179f1676fbc54576a036f46b9d096fea33131c4f30fa6476',
@@ -66,4 +76,19 @@ export function buildWindowsQQTokenLoginCall({ openid, musickey, expiredIn, musi
     access_token: string(accessToken, 'accessToken'),
     refresh_token: string(refreshToken, 'refreshToken')
   })
+}
+
+/** Native QQRefreshToken uses Login with onlyNeedAccessToken=1 and omits forceRefreshToken. */
+export function buildWindowsQQTokenRefreshCall(options = {}) {
+  if (cString(options.refreshToken, 'refreshToken').length === 0) {
+    throw new TypeError('refreshToken must not be empty')
+  }
+  const { forceRefreshToken: _unused, ...param } = buildWindowsQQTokenLoginCall(options).param
+  param.onlyNeedAccessToken = 1
+  return call(param)
+}
+
+/** Native QQRefreshKey retains the restoration fields and both signed32 zero flags. */
+export function buildWindowsQQMusicKeyRefreshCall(options = {}) {
+  return buildWindowsQQTokenLoginCall(options)
 }

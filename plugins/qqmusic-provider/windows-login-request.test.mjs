@@ -2,7 +2,9 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { nativeSigned64 } from './lib/windows/json-integer.mjs'
 import { buildWindowsQrLoginCall, buildWindowsQQCodeLoginCall,
-  buildWindowsQQTokenLoginCall, WINDOWS_LOGIN_REQUEST_KEY } from './lib/windows/login-request.mjs'
+  buildWindowsQQTokenLoginCall, buildWindowsQQTokenRefreshCall,
+  buildWindowsQQMusicKeyRefreshCall, WINDOWS_LOGIN_REQUEST_KEY,
+  WINDOWS_QQ_TOKEN_REFRESH_REQUEST_KEY, WINDOWS_QQ_MUSIC_KEY_REFRESH_REQUEST_KEY } from './lib/windows/login-request.mjs'
 
 test('actual Windows QR producer has exactly three fields and preserves numeric ID precision', () => {
   const result = buildWindowsQrLoginCall({ musicId: '9007199254740993', token: 'public-fake-token', qrCodeId: 'public-fake-qr' })
@@ -60,4 +62,20 @@ test('C-string fields reject silent native truncation and preserve empty values'
   assert.throws(() => buildWindowsQrLoginCall({ musicId: '1', token: '', qrCodeId: 'fake\0id' }), /qrCodeId must not contain NUL/)
   assert.throws(() => buildWindowsQQCodeLoginCall({ code: 'fake\0code', deviceName: '' }), /code must not contain NUL/)
   assert.equal(JSON.stringify(buildWindowsQrLoginCall({ musicId: '0', token: '', qrCodeId: '' }).param), '{"musicid":0,"token":"","qrCodeID":""}')
+})
+
+test('exact native refresh builders use Login with distinct request keys and token flags', () => {
+  const options = { openid: 'public-openid', musickey: 'public-key', expiredIn: '1800000000',
+    musicId: '9007199254740993', refreshKey: 'public-refresh-key', accessToken: 'public-access',
+    refreshToken: 'public-refresh', deviceName: 'public-device' }
+  assert.equal(WINDOWS_QQ_TOKEN_REFRESH_REQUEST_KEY, 'QQRefreshToken')
+  assert.equal(WINDOWS_QQ_MUSIC_KEY_REFRESH_REQUEST_KEY, 'QQRefreshKey')
+  const token = buildWindowsQQTokenRefreshCall(options)
+  assert.equal(token.module, 'music.login.LoginServer')
+  assert.equal(token.method, 'Login')
+  assert.equal(token.param.onlyNeedAccessToken, 1)
+  assert.equal(Object.hasOwn(token.param, 'forceRefreshToken'), false)
+  assert.ok(JSON.stringify(token).includes('"musicid":9007199254740993'))
+  assert.deepEqual(buildWindowsQQMusicKeyRefreshCall(options), buildWindowsQQTokenLoginCall(options))
+  assert.throws(() => buildWindowsQQTokenRefreshCall({ ...options, refreshToken: '' }), /must not be empty/)
 })
