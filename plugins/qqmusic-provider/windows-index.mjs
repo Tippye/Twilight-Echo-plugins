@@ -4,7 +4,8 @@ import { WindowsMusicClient } from './lib/windows/client.mjs'
 import { buildWindowsDesktopSearchCall, WINDOWS_DESKTOP_SEARCH_REQUEST_KEY } from './lib/windows/search-call.mjs'
 import { mapWindowsTrack, windowsSearchPage, windowsSearchWindow, windowsSongReference, windowsSongMedia, windowsTrackPlaybackQualities } from './lib/windows/tracks.mjs'
 import { buildWindowsTrackInfoCall, WINDOWS_TRACK_INFO_REQUEST_KEY } from './lib/windows/song-detail-call.mjs'
-import { createWindowsPlaybackResolver, WINDOWS_MEDIA_ALLOWED_ORIGINS } from './lib/windows/media-source.mjs'
+import { createWindowsPlaybackResolver, windowsPlaybackFailureDetails, windowsPlaybackSessionFingerprint, WINDOWS_MEDIA_ALLOWED_ORIGINS } from './lib/windows/media-source.mjs'
+import { windowsQualityDefinition, windowsQualityFallbacks } from './lib/windows/quality.mjs'
 import { WindowsAudioProxy } from './lib/windows/audio-proxy.mjs'
 import { buildWindowsPlayLyricInfoCall, decodeWindowsPlayLyricResponse, WINDOWS_PLAY_LYRIC_REQUEST_KEY } from './lib/windows/lyric-call.mjs'
 import { searchWindowsCatalog } from './lib/windows/search-catalog.mjs'
@@ -22,6 +23,22 @@ import { serializeWindowsSettings, windowsPlaybackQuality, windowsQualityForm, s
   windowsQualityState, setWindowsPlaybackQuality, WINDOWS_QUALITY_COMMAND } from './lib/windows/settings.mjs'
 
 let active = null
+const playbackFailures = new WeakSet()
+
+function playbackUnavailable(reason, canceled = false) {
+  const error = new Error(`${reason} [TE-ERR:provider.playbackUnavailable:reason=${encodeURIComponent(reason)}]`)
+  if (canceled) error.name = 'AbortError'
+  playbackFailures.add(error)
+  return error
+}
+
+function terminalPlaybackFailure(error) {
+  if (playbackFailures.has(error)) return error
+  const details = windowsPlaybackFailureDetails(error)
+  let canceled = false
+  try { canceled = error?.name === 'AbortError' } catch {}
+  return playbackUnavailable(details?.message ?? (canceled ? 'QQ 音乐播放已取消' : 'QQ 音乐当前歌曲无法播放'), canceled)
+}
 
 export async function activate(context) {
   if (!context.twilight?.qqAuth) throw new Error('QQ 音乐 Windows 音源需要支持 QQ 官方登录桥的 Twilight 构建')
@@ -36,7 +53,7 @@ export async function activate(context) {
       client: state.client, disstid, loginUin, signal }) })
   active = state
   const handler = fn => async (...args) => {
-    if (state.closed) throw new Error('QQ 音乐音源已停用')
+    if (state.closed) throw fn === getPlaybackUrl ? playbackUnavailable('QQ 音乐音源已停用', true) : new Error('QQ 音乐音源已停用')
     const invocation = args.pop()
     return fn(state, args, invocation)
   }
@@ -373,45 +390,92 @@ async function getLyrics(state, args, invocation) {
 
 async function getPlaybackUrl(state, args, invocation) {
   const epoch = state.playbackEpoch
+  const accountEpoch = state.epoch
   const signal = invocation?.signal
-  if (!await state.client.checkLogin({ signal })) throw new Error('请先使用手机 QQ 扫码登录')
-  const options = args[1] ?? {}
-  if (typeof options !== 'object' || options === null || Array.isArray(options)) throw new Error('QQ 音乐音质参数无效')
-  // Search/list metadata may be partial. Resolve an exact current TrackInfo row
-  // before treating a zero size as a missing format, including direct API calls.
-  const song = windowsSongMedia(await getSong(state, args[0], signal, { refresh: true }))
-  const resolver = createWindowsPlaybackResolver({ client: state.client, getDevice: () => getDevice(state),
-    song, quality: options.quality ?? await windowsPlaybackQuality(state.settings) })
-  let lease
+  const assertCurrent = () => {
+    if (state.closed || state.playbackEpoch !== epoch || state.epoch !== accountEpoch || signal?.aborted) {
+      throw playbackUnavailable('QQ 音乐播放已取消', true)
+    }
+  }
   try {
-    lease = await state.proxy.open({ signal, resolve: request => {
-      if (state.closed || state.playbackEpoch !== epoch) throw new Error('QQ 音乐播放已取消')
-      return resolver.resolve(request)
-    } })
-    if (state.closed || state.playbackEpoch !== epoch || signal?.aborted) throw new Error('QQ 音乐播放已取消')
-    const entry = { resolver, lease, timer: null }
-    entry.timer = setTimeout(() => {
-      state.playbacks.delete(lease.url)
-      resolver.dispose()
-      lease.release().catch(() => {})
-    }, Math.max(1, lease.expiresAt - Date.now()))
-    entry.timer.unref?.()
-    state.playbacks.set(lease.url, entry)
-    while (state.playbacks.size > 512) {
-      const [url, previous] = state.playbacks.entries().next().value
-      state.playbacks.delete(url)
-      clearTimeout(previous.timer)
-      previous.resolver.dispose()
-      await previous.lease.release()
+    assertCurrent()
+    if (!await state.client.checkLogin({ signal })) throw playbackUnavailable('请先使用手机 QQ 扫码登录')
+    assertCurrent()
+    const owner = await verifiedLibrarySession(state, signal)
+    assertCurrent()
+    const fingerprint = windowsPlaybackSessionFingerprint(owner.session)
+    const confirmCurrent = async () => {
+      assertCurrent()
+      let session
+      try { session = await state.client.getSession() } catch (error) { assertCurrent(); throw error }
+      assertCurrent()
+      let currentFingerprint
+      try { currentFingerprint = windowsPlaybackSessionFingerprint(session) } catch {}
+      // A quality chain is one authorization transaction. Even replacement
+      // credentials for the same musicid cannot continue an earlier attempt.
+      if (currentFingerprint !== fingerprint) throw playbackUnavailable('QQ 音乐会话已变化，播放已取消', true)
     }
-    return { streamUrl: lease.url, providerSource: { ...(lease.bytes === undefined ? {} : { bytes: lease.bytes }), expiresAt: lease.expiresAt } }
+    const options = args[1] ?? {}
+    if (typeof options !== 'object' || options === null || Array.isArray(options)) throw playbackUnavailable('QQ 音乐音质参数无效')
+    // One exact TrackInfo row owns every attempt. Falling back never searches,
+    // rematches a recording, or writes the user's preferred quality.
+    const song = windowsSongMedia(await getSong(state, args[0], signal, { refresh: true }))
+    await confirmCurrent()
+    const preferred = options.quality ?? await windowsPlaybackQuality(state.settings)
+    await confirmCurrent()
+    const candidates = windowsQualityFallbacks(preferred)
+    if (!candidates.length) throw playbackUnavailable('QQ 音乐音质参数无效')
+    let lastFailure = playbackUnavailable('当前歌曲没有可用的播放音质')
+    for (const quality of candidates) {
+      await confirmCurrent()
+      if (song.sizes[windowsQualityDefinition(quality).sizeKey] === 0) continue
+      let resolver
+      let lease
+      let entry
+      try {
+        resolver = createWindowsPlaybackResolver({ client: state.client, getDevice: () => getDevice(state), song, quality })
+        // A published lease keeps this exact resolver, including later transport
+        // refreshes. Range identity cannot change to another quality midstream.
+        lease = await state.proxy.open({ signal, resolve: request => {
+          assertCurrent()
+          return resolver.resolve(request)
+        } })
+        await confirmCurrent()
+        entry = { resolver, lease, timer: null }
+        entry.timer = setTimeout(() => {
+          state.playbacks.delete(lease.url)
+          resolver.dispose()
+          lease.release().catch(() => {})
+        }, Math.max(1, lease.expiresAt - Date.now()))
+        entry.timer.unref?.()
+        state.playbacks.set(lease.url, entry)
+        while (state.playbacks.size > 512) {
+          const [url, previous] = state.playbacks.entries().next().value
+          state.playbacks.delete(url)
+          clearTimeout(previous.timer)
+          previous.resolver.dispose()
+          await previous.lease.release()
+        }
+        await confirmCurrent()
+        return { streamUrl: lease.url, providerSource: { actualQuality: quality,
+          ...(lease.bytes === undefined ? {} : { bytes: lease.bytes }), expiresAt: lease.expiresAt } }
+      } catch (error) {
+        if (entry) { clearTimeout(entry.timer); state.playbacks.delete(lease.url) }
+        resolver?.dispose()
+        await Promise.allSettled(lease ? [lease.release()] : [])
+        await confirmCurrent()
+        const details = windowsPlaybackFailureDetails(error)
+        if (!details?.recoverableQuality) throw error
+        lastFailure = error
+      }
+    }
+    throw lastFailure
   } catch (error) {
-    resolver.dispose()
-    await lease?.release()
-    if (error?.name === 'WindowsPlaybackSourceError') {
-      const code = typeof error.code === 'number' || /^[A-Z_]{1,32}$/.test(error.code ?? '') ? error.code : 'SOURCE'
-      state.context.logger?.warn?.(`QQ playback source validation: ${code}`)
-    }
-    throw error
+    // Terminal same-track failure survives Electron IPC so the host can stop
+    // before generic re-matching or queue-advance recovery. Never quote upstream
+    // error text, which may contain an account, signed URL, or key.
+    const details = windowsPlaybackFailureDetails(error)
+    try { if (details) state.context.logger?.warn?.(`QQ playback source validation: ${details.code}`) } catch {}
+    throw terminalPlaybackFailure(error)
   }
 }

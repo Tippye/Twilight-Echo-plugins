@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { readFileSync } from 'node:fs'
 import { request } from 'node:http'
-import { createWindowsPlaybackResolver, WINDOWS_MEDIA_ALLOWED_ORIGINS } from './lib/windows/media-source.mjs'
+import { createWindowsPlaybackResolver, windowsPlaybackFailureDetails, WINDOWS_MEDIA_ALLOWED_ORIGINS } from './lib/windows/media-source.mjs'
 import { WindowsMediaStream } from './lib/windows/media-stream.mjs'
 import { WindowsAudioProxy } from './lib/windows/audio-proxy.mjs'
 
@@ -72,6 +72,44 @@ function safeError(error, code) {
   if (code !== undefined) assert.equal(error.code, code)
   return true
 }
+
+test('only current trusted quality failures authorize fallback; spoofed, replayed, and transport errors do not', async t => {
+  let trusted
+  const issuer = harness(t, { client: { request: async () => ({ retcode: 22 }) } })
+  await assert.rejects(issuer.resolver.resolve(), error => {
+    trusted = error
+    assert.deepEqual(windowsPlaybackFailureDetails(error), {
+      code: 22, message: 'QQ 音乐服务端拒绝所选音质（22）', recoverableQuality: true })
+    return true
+  })
+  trusted.code = 403
+  trusted.message = 'PRIVATE_ACCOUNT_AND_TOKEN'
+  assert.equal(windowsPlaybackFailureDetails(trusted).recoverableQuality, true)
+  assert.equal(windowsPlaybackFailureDetails(trusted).message.includes('PRIVATE'), false)
+  const absent = (() => { try { createWindowsPlaybackResolver({ client: issuer.client, getDevice: () => device,
+    song: { ...song, sizes: { dolby: 0 } }, quality: 'dolby' }) } catch (error) { return error } })()
+  assert.equal(windowsPlaybackFailureDetails(absent).recoverableQuality, true)
+  const spoofed = Object.assign(Error('PRIVATE'), { name: 'WindowsPlaybackSourceError', code: 22, recoverableQuality: true })
+  assert.equal(windowsPlaybackFailureDetails(spoofed), null)
+  for (const raw of [spoofed, trusted, absent, Object.assign(Error('PRIVATE'), { code: 22 })]) {
+    for (const phase of ['request', 'fetch', 'response-getter']) {
+      const h = harness(t, phase === 'request' ? { client: { request: async () => { throw raw } } }
+        : phase === 'fetch' ? { fetch: async () => { throw raw } }
+          : { client: { request: async () => Object.defineProperty({}, 'retcode', { get() { throw raw } }) } })
+      await assert.rejects(h.resolver.resolve(), error => windowsPlaybackFailureDetails(error)?.recoverableQuality === false)
+    }
+  }
+  const returned = windowsPlaybackFailureDetails(trusted)
+  returned.recoverableQuality = false
+  assert.equal(windowsPlaybackFailureDetails(trusted).recoverableQuality, true)
+  for (const code of [23, 403, '22']) {
+    const h = harness(t, { client: { request: async () => ({ retcode: code }) } })
+    await assert.rejects(h.resolver.resolve(), error => windowsPlaybackFailureDetails(error)?.recoverableQuality === false)
+  }
+  const empty = harness(t, { client: { request: async (_key, call) => ({ retcode: 0, midurlinfo: [{
+    filename: call.param.filename[0], songmid: song.songmid, result: 0, purl: '' }] }) } })
+  await assert.rejects(empty.resolver.resolve(), error => windowsPlaybackFailureDetails(error)?.recoverableQuality === true)
+})
 
 test('playback rejection privately owns codes and rebuilds mutable/spoofed errors without leaking unsafe getters', async t => {
   const marker = 'PUBLIC_RAW_PROVIDER_MESSAGE'

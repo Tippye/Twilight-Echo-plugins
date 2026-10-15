@@ -3,12 +3,30 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { mapWindowsTrack, isUnsupportedWindowsSong, windowsSongReference, windowsSongMid, windowsSongMedia, windowsTrackPlaybackQualities, windowsSearchPage, windowsSearchWindow } from './lib/windows/tracks.mjs'
 import { windowsArtistReference, windowsAlbumReference } from './lib/windows/search-catalog.mjs'
+import { windowsQualityFallbacks } from './lib/windows/quality.mjs'
 
 const fixture = JSON.parse(readFileSync(new URL('./test/fixtures/windows-public-search-songs.json', import.meta.url)))
 // Artificial metadata only; this reproduces the observed shape without private values.
 const unsupportedSong = () => ({ ...structuredClone(fixture.publicSongs[0]), id: 123,
   mid: '', title: '公开测试记录', name: '公开测试记录', type: 21, data_type: 0,
   file: { ...fixture.publicSongs[0].file, media_mid: '' } })
+
+test('quality fallback chains stay bounded, never upgrade ordinary selections or cross spatial formats', () => {
+  const expected = { '128': ['128'], '320': ['320', '128'], flac: ['flac', '320', '128'],
+    hires: ['hires', 'flac', '320', '128'], dolby: ['dolby', 'hires', 'flac', '320', '128'],
+    surround: ['surround', 'hires', 'flac', '320', '128'] }
+  for (const [quality, chain] of Object.entries(expected)) {
+    assert.deepEqual(windowsQualityFallbacks(quality), chain)
+    assert.equal(new Set(chain).size, chain.length)
+    const changed = windowsQualityFallbacks(quality)
+    changed.push('injected')
+    assert.deepEqual(windowsQualityFallbacks(quality), chain)
+  }
+  for (const [alias, target] of [['default', '128'], ['high', '320'], ['lossless', 'flac']]) {
+    assert.deepEqual(windowsQualityFallbacks(alias), expected[target])
+  }
+  for (const invalid of [null, '', 'auto', 'toString', 320]) assert.deepEqual(windowsQualityFallbacks(invalid), [])
+})
 
 test('observed Windows song DTO maps a stable Track without persisting media credentials', () => {
   const song = fixture.publicSongs[0]

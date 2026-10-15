@@ -10,6 +10,15 @@ const definitions = Object.freeze({
   dolby: Object.freeze({ type: 12, encrypted: true, codec: 'mp4', contentType: 'audio/mp4', sizeKey: 'dolby', sizeField: 'size_dolby' })
 })
 const aliases = Object.freeze({ default: '128', high: '320', lossless: 'flac' })
+// Spatial formats are separate preferences, not rungs in a shared numeric enum.
+// A missing spatial source falls back to ordinary audio without trying the other
+// spatial format; ordinary selections never upgrade beyond the chosen quality.
+const fallbackChains = Object.freeze({
+  '128': ['128'], '320': ['320', '128'], flac: ['flac', '320', '128'],
+  hires: ['hires', 'flac', '320', '128'],
+  dolby: ['dolby', 'hires', 'flac', '320', '128'],
+  surround: ['surround', 'hires', 'flac', '320', '128']
+})
 export const WINDOWS_QUALITY_OPTIONS = Object.freeze([
   ['标准 MP3（128 kbps）', '128'], ['高品质 MP3（320 kbps）', '320'], ['无损 FLAC', 'flac'],
   ['Hi-Res 无损', 'hires'], ['杜比全景声', 'dolby'], ['5.1 品质', 'surround']
@@ -18,6 +27,12 @@ export function windowsQualityDefinition(value) {
   if (typeof value !== 'string') return null
   const key = Object.hasOwn(aliases, value) ? aliases[value] : value
   return Object.hasOwn(definitions, key) ? definitions[key] : null
+}
+
+export function windowsQualityFallbacks(value) {
+  if (!windowsQualityDefinition(value)) return []
+  const key = Object.hasOwn(aliases, value) ? aliases[value] : value
+  return [...fallbackChains[key]]
 }
 
 /** Native file-size flags identify candidates, independently of account permission.

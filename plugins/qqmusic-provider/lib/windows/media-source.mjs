@@ -34,13 +34,20 @@ function failureMessage(code, phase) {
   if (typeof code === 'string' && code.startsWith('VKEY_')) return 'QQ 音乐所选音质的播放地址响应无效'
   return 'QQ 音乐播放源无法验证'
 }
-function failure(code = 'SOURCE', phase = 'source') {
+function failure(code = 'SOURCE', phase = 'source', recoverableQuality = false, qualityOwner = null) {
   const safeCode = Number.isSafeInteger(code) || failureCodes.has(code) ? code : 'SOURCE'
   const error = new Error(failureMessage(safeCode, phase))
   error.name = 'WindowsPlaybackSourceError'
   error.code = safeCode
-  ownedFailureCodes.set(error, { code: safeCode, phase })
+  ownedFailureCodes.set(error, { code: safeCode, phase, recoverableQuality, qualityOwner })
   return error
+}
+// Only privately created failures can authorize trying another format. Public
+// error fields may be mutated or spoofed by injected transport implementations.
+export function windowsPlaybackFailureDetails(error) {
+  const owned = ownedFailureCodes.get(error)
+  return owned ? { code: owned.code, message: failureMessage(owned.code, owned.phase),
+    recoverableQuality: owned.recoverableQuality } : null
 }
 function aborted() {
   const error = new Error('QQ 音乐播放源请求已取消')
@@ -48,14 +55,15 @@ function aborted() {
   return error
 }
 function check(signal) { if (signal.aborted) throw aborted() }
-function normalizedError(error, signal, phase) {
+function normalizedError(error, signal, phase, qualityOwner) {
   try {
     if (signal.aborted) return aborted()
     // Errors exposed by this module can be caught, mutated and rethrown by an
     // injected client. Rebuild them from the original private code only.
     if (ownedFailureCodes.has(error)) {
       const owned = ownedFailureCodes.get(error)
-      return failure(owned.code, owned.phase)
+      return failure(owned.code, owned.phase,
+        owned.recoverableQuality && owned.qualityOwner === qualityOwner, qualityOwner)
     }
     if (error?.name === 'AbortError') return aborted()
     const code = error?.code
@@ -70,6 +78,7 @@ function sessionFingerprint(session) {
     BigInt(session.musicid) <= 0n || BigInt(session.musicid) > MAX_UINT64) throw failure('LOGIN')
   return hash(JSON.stringify(session))
 }
+export { sessionFingerprint as windowsPlaybackSessionFingerprint }
 function deviceGuid(device) {
   if (!device || typeof device.guid !== 'string' || !device.guid ||
     device.guid.length > 256 || device.guid.includes('\0')) throw failure('DEVICE')
@@ -118,16 +127,16 @@ function url(value, base, upgrade = false) {
 function businessCode(value) {
   return Number.isSafeInteger(value) && value !== 0 ? value : 'VKEY_RESPONSE'
 }
-function sourceURL(data, filename, songmid) {
+function sourceURL(data, filename, songmid, qualityOwner) {
   const retcode = data?.retcode
-  if (!data || retcode !== 0) throw failure(Number.isSafeInteger(retcode) && retcode !== 0 ? retcode : 'VKEY_RETCODE', 'vkey')
+  if (!data || retcode !== 0) throw failure(Number.isSafeInteger(retcode) && retcode !== 0 ? retcode : 'VKEY_RETCODE', 'vkey', retcode === 22, qualityOwner)
   if (!Array.isArray(data.midurlinfo) || data.midurlinfo.length !== 1) throw failure('VKEY_ITEMS')
   const row = data.midurlinfo[0]
   if (!row || row.filename !== filename) throw failure('VKEY_FILENAME')
   if (row.songmid !== songmid) throw failure('VKEY_SONGMID')
   const result = row.result
-  if (result !== 0) throw failure(businessCode(result), 'vkey')
-  if (typeof row.purl !== 'string' || !row.purl) throw failure('VKEY_EMPTY')
+  if (result !== 0) throw failure(businessCode(result), 'vkey', result === 22, qualityOwner)
+  if (typeof row.purl !== 'string' || !row.purl) throw failure('VKEY_EMPTY', 'vkey', true, qualityOwner)
   const absolute = /^[a-z][a-z0-9+.-]*:/i.test(row.purl)
   // Actual Windows Vkey can issue a relative purl without sip. This fixed official
   // CDN is an adapter choice and is accepted only after HTTPS byte/header preflight.
@@ -259,7 +268,7 @@ export function createWindowsPlaybackResolver({ client, getDevice, song, quality
     !Number.isInteger(song.songtype) || song.songtype < -0x80000000 || song.songtype > 0x7fffffff) throw failure('SONG')
   // Only an explicitly observed zero rules a format out. Missing metadata stays
   // unknown and is still verified through the authenticated issuer and bytes.
-  if (song.sizes?.[selected.sizeKey] === 0) throw failure('QUALITY_UNAVAILABLE')
+  if (song.sizes?.[selected.sizeKey] === 0) throw failure('QUALITY_UNAVAILABLE', 'source', true)
   const descriptor = { songmid: song.songmid, songid: BigInt(song.songid).toString(),
     mediaMid: song.mediaMid, songtype: song.songtype }
   const filename = buildWindowsMediaFilename({ mediaMid: descriptor.mediaMid, type: selected.type,
@@ -286,6 +295,7 @@ export function createWindowsPlaybackResolver({ client, getDevice, song, quality
   async function run(refresh, signal) {
     let observed
     let phase = 'source'
+    const qualityOwner = Symbol()
     try {
       check(signal)
       if (closed) throw failure('CLOSED')
@@ -304,9 +314,10 @@ export function createWindowsPlaybackResolver({ client, getDevice, song, quality
       const call = buildWindowsVkeyCall({ songs: { filename: [filename], musicfile: [filename],
         songmid: [descriptor.songmid], songtype: [descriptor.songtype] }, guid,
         uin: session.musicid, downloadFrom: 0, encrypted: selected.encrypted })
-      phase = 'vkey'
+      phase = 'vkey-request'
       const data = await wait(client.request('queryvkey', call, { signal, session }), signal)
-      const issued = sourceURL(data, filename, descriptor.songmid)
+      phase = 'vkey'
+      const issued = sourceURL(data, filename, descriptor.songmid, qualityOwner)
       phase = 'media'
       observed = await preflight(fetch, issued.url, selected.encrypted, issued.ekey, selected.codec, signal)
       // RPC epoch guards end before CDN preflight. Revalidate before transferring any key.
@@ -320,7 +331,7 @@ export function createWindowsPlaybackResolver({ client, getDevice, song, quality
       return owned(cache)
     } catch (error) {
       clear()
-      throw normalizedError(error, signal, phase)
+      throw normalizedError(error, signal, phase, qualityOwner)
     } finally { observed?.key?.fill(0) }
   }
   return {
