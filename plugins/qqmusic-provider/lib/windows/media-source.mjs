@@ -20,14 +20,26 @@ const HEADERS = Object.freeze({ 'User-Agent': WINDOWS_USER_AGENT, Accept: '*/*' 
 const failureCodes = new Set(['SOURCE', 'LOGIN', 'DEVICE', 'LENGTH', 'URL', 'ORIGIN',
   'VKEY_RESPONSE', 'VKEY_RETCODE', 'VKEY_ITEMS', 'VKEY_FILENAME', 'VKEY_SONGMID', 'VKEY_EMPTY',
   'REDIRECT', 'ENCODING', 'BODY', 'TRUNCATED', 'RANGE', 'HEADER', 'IDENTITY', 'KEY',
-  'CONFIG', 'QUALITY', 'SONG', 'TIME', 'SESSION', 'CLOSED'])
+  'CONFIG', 'QUALITY', 'QUALITY_UNAVAILABLE', 'SONG', 'TIME', 'SESSION', 'CLOSED', 'CONTAINER'])
 const ownedFailureCodes = new WeakMap()
 
-function failure(code = 'SOURCE') {
-  const error = new Error('QQ 音乐播放源无法验证')
+function failureMessage(code, phase) {
+  if (code === 'QUALITY_UNAVAILABLE') return '当前歌曲未提供所选音质'
+  if (code === 'LOGIN') return '请先使用手机 QQ 扫码登录'
+  if (code === 'VKEY_EMPTY') return 'QQ 音乐未返回所选音质的播放地址'
+  if (Number.isSafeInteger(code)) return phase === 'http' ? `QQ 音乐音频请求失败（HTTP ${code}）`
+    : phase === 'vkey' ? `QQ 音乐服务端拒绝所选音质（${code}）`
+      : `QQ 音乐播放源请求失败（${code}）`
+  if (['KEY', 'HEADER', 'CONTAINER'].includes(code)) return 'QQ 音乐所选音质的音频格式或解密验证失败'
+  if (typeof code === 'string' && code.startsWith('VKEY_')) return 'QQ 音乐所选音质的播放地址响应无效'
+  return 'QQ 音乐播放源无法验证'
+}
+function failure(code = 'SOURCE', phase = 'source') {
+  const safeCode = Number.isSafeInteger(code) || failureCodes.has(code) ? code : 'SOURCE'
+  const error = new Error(failureMessage(safeCode, phase))
   error.name = 'WindowsPlaybackSourceError'
-  error.code = Number.isSafeInteger(code) || failureCodes.has(code) ? code : 'SOURCE'
-  ownedFailureCodes.set(error, error.code)
+  error.code = safeCode
+  ownedFailureCodes.set(error, { code: safeCode, phase })
   return error
 }
 function aborted() {
@@ -36,15 +48,18 @@ function aborted() {
   return error
 }
 function check(signal) { if (signal.aborted) throw aborted() }
-function normalizedError(error, signal) {
+function normalizedError(error, signal, phase) {
   try {
     if (signal.aborted) return aborted()
     // Errors exposed by this module can be caught, mutated and rethrown by an
     // injected client. Rebuild them from the original private code only.
-    if (ownedFailureCodes.has(error)) return failure(ownedFailureCodes.get(error))
+    if (ownedFailureCodes.has(error)) {
+      const owned = ownedFailureCodes.get(error)
+      return failure(owned.code, owned.phase)
+    }
     if (error?.name === 'AbortError') return aborted()
     const code = error?.code
-    if (Number.isSafeInteger(code)) return failure(code)
+    if (Number.isSafeInteger(code)) return failure(code, phase)
   } catch {}
   return failure('SOURCE')
 }
@@ -105,13 +120,13 @@ function businessCode(value) {
 }
 function sourceURL(data, filename, songmid) {
   const retcode = data?.retcode
-  if (!data || retcode !== 0) throw failure(Number.isSafeInteger(retcode) && retcode !== 0 ? retcode : 'VKEY_RETCODE')
+  if (!data || retcode !== 0) throw failure(Number.isSafeInteger(retcode) && retcode !== 0 ? retcode : 'VKEY_RETCODE', 'vkey')
   if (!Array.isArray(data.midurlinfo) || data.midurlinfo.length !== 1) throw failure('VKEY_ITEMS')
   const row = data.midurlinfo[0]
   if (!row || row.filename !== filename) throw failure('VKEY_FILENAME')
   if (row.songmid !== songmid) throw failure('VKEY_SONGMID')
   const result = row.result
-  if (result !== 0) throw failure(businessCode(result))
+  if (result !== 0) throw failure(businessCode(result), 'vkey')
   if (typeof row.purl !== 'string' || !row.purl) throw failure('VKEY_EMPTY')
   const absolute = /^[a-z][a-z0-9+.-]*:/i.test(row.purl)
   // Actual Windows Vkey can issue a relative purl without sip. This fixed official
@@ -166,7 +181,7 @@ async function range(fetch, value, start, end, total, signal) {
     headers: { ...HEADERS, 'Accept-Encoding': 'identity', Range: `bytes=${start}-${end}` } }, signal)
   const response = result.response
   try {
-    if (response.status !== 206) throw failure(response.status)
+    if (response.status !== 206) throw failure(response.status, 'http')
     const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('content-range') ?? '')
     if (!match || unsigned(match[1]) !== start || unsigned(match[2]) !== end) throw failure('RANGE')
     const observedTotal = unsigned(match[3])
@@ -191,7 +206,7 @@ async function preflight(fetch, value, encrypted, ekey, codec, signal) {
       if (head.response.status === 200) {
         const length = head.response.headers.get('content-length')
         if (length !== null) total = unsigned(length)
-      } else if (![405, 501].includes(head.response.status)) throw failure(head.response.status)
+      } else if (![405, 501].includes(head.response.status)) throw failure(head.response.status, 'http')
     } finally { cancelBody(head.response) }
     if (total !== null && total < 128n) throw failure('HEADER')
     // One bounded Range supplies total length when HEAD has no length or is unsupported.
@@ -202,7 +217,9 @@ async function preflight(fetch, value, encrypted, ekey, codec, signal) {
     const last = await range(fetch, first.url, total - tailSize, total - 1n, total, signal)
     tail = last.bytes
     if (last.url !== first.url) throw failure('IDENTITY')
-    const container = inspectWindowsMediaTail({ tail, upstreamLength: total.toString(), encrypted, serverEkey: ekey })
+    let container
+    try { container = inspectWindowsMediaTail({ tail, upstreamLength: total.toString(), encrypted, serverEkey: ekey }) }
+    catch { throw failure(encrypted ? 'KEY' : 'CONTAINER') }
     key = container.key
     const tailBytes = unsigned(container.tailBytes)
     const length = total - tailBytes
@@ -213,7 +230,7 @@ async function preflight(fetch, value, encrypted, ekey, codec, signal) {
       stream = new WindowsMediaStream(key)
       stream.transform(decoded, '0')
     }
-    validateWindowsAudioHeader(decoded, codec)
+    try { validateWindowsAudioHeader(decoded, codec) } catch { throw failure('HEADER') }
     const result = { url: first.url, upstreamLength: total.toString(), length: length.toString(),
       tailBytes: tailBytes.toString(), key, prefixHash: hash(decoded), keyDigest: key ? hash(key) : '' }
     check(signal)
@@ -240,6 +257,9 @@ export function createWindowsPlaybackResolver({ client, getDevice, song, quality
     typeof song.songid !== 'string' || !/^\d+$/.test(song.songid) || song.songid.length > 10 ||
     BigInt(song.songid) < 1n || BigInt(song.songid) > 0xffffffffn ||
     !Number.isInteger(song.songtype) || song.songtype < -0x80000000 || song.songtype > 0x7fffffff) throw failure('SONG')
+  // Only an explicitly observed zero rules a format out. Missing metadata stays
+  // unknown and is still verified through the authenticated issuer and bytes.
+  if (song.sizes?.[selected.sizeKey] === 0) throw failure('QUALITY_UNAVAILABLE')
   const descriptor = { songmid: song.songmid, songid: BigInt(song.songid).toString(),
     mediaMid: song.mediaMid, songtype: song.songtype }
   const filename = buildWindowsMediaFilename({ mediaMid: descriptor.mediaMid, type: selected.type,
@@ -265,6 +285,7 @@ export function createWindowsPlaybackResolver({ client, getDevice, song, quality
   }
   async function run(refresh, signal) {
     let observed
+    let phase = 'source'
     try {
       check(signal)
       if (closed) throw failure('CLOSED')
@@ -283,8 +304,10 @@ export function createWindowsPlaybackResolver({ client, getDevice, song, quality
       const call = buildWindowsVkeyCall({ songs: { filename: [filename], musicfile: [filename],
         songmid: [descriptor.songmid], songtype: [descriptor.songtype] }, guid,
         uin: session.musicid, downloadFrom: 0, encrypted: selected.encrypted })
+      phase = 'vkey'
       const data = await wait(client.request('queryvkey', call, { signal, session }), signal)
       const issued = sourceURL(data, filename, descriptor.songmid)
+      phase = 'media'
       observed = await preflight(fetch, issued.url, selected.encrypted, issued.ekey, selected.codec, signal)
       // RPC epoch guards end before CDN preflight. Revalidate before transferring any key.
       await confirmCurrent(fingerprint, guid, signal)
@@ -297,7 +320,7 @@ export function createWindowsPlaybackResolver({ client, getDevice, song, quality
       return owned(cache)
     } catch (error) {
       clear()
-      throw normalizedError(error, signal)
+      throw normalizedError(error, signal, phase)
     } finally { observed?.key?.fill(0) }
   }
   return {

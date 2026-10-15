@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { mapWindowsTrack, isUnsupportedWindowsSong, windowsSongReference, windowsSongMid, windowsSongMedia, windowsSearchPage, windowsSearchWindow } from './lib/windows/tracks.mjs'
+import { mapWindowsTrack, isUnsupportedWindowsSong, windowsSongReference, windowsSongMid, windowsSongMedia, windowsTrackPlaybackQualities, windowsSearchPage, windowsSearchWindow } from './lib/windows/tracks.mjs'
 import { windowsArtistReference, windowsAlbumReference } from './lib/windows/search-catalog.mjs'
 
 const fixture = JSON.parse(readFileSync(new URL('./test/fixtures/windows-public-search-songs.json', import.meta.url)))
@@ -34,6 +34,37 @@ test('native UInt32 song IDs remain exact and reject incompatible detail IDs', (
   for (const id of ['4294967296', '9007199254740993', 9007199254740992, 0]) {
     assert.throws(() => windowsSongMedia({ ...song, id }), /媒体信息/)
   }
+})
+
+test('per-track qualities retain native format candidates, explicit zero and unknown separately from rights', () => {
+  const song = structuredClone(fixture.publicSongs[0])
+  Object.assign(song.file, { size_128mp3: 1000, size_320mp3: 2000, size_flac: 3000,
+    size_hires: 0, size_dolby: 4000 })
+  delete song.file.size_dts
+  const result = windowsTrackPlaybackQualities(song)
+  assert.equal(result.trackId, 'qq:0039MnYb0qxYhV:97773')
+  assert.deepEqual(result.options.map(({ value, availability, metadataSize }) =>
+    [value, availability, metadataSize]), [['128', 'candidate', 1000], ['320', 'candidate', 2000],
+    ['flac', 'candidate', 3000], ['hires', 'unavailable', 0], ['dolby', 'candidate', 4000], ['surround', 'unknown', undefined]])
+  assert.match(result.options.find(option => option.value === 'dolby').reason, /当前账号验证/)
+  assert.equal(windowsSongMedia(song).sizes.surround, null)
+  assert.equal(windowsSongMedia(song).sizes.hires, 0)
+  assert.equal(windowsSongMedia(song).sizes.dolby, 4000)
+  assert.equal(Object.hasOwn(result.options[5], 'metadataSize'), false)
+})
+
+test('malformed or missing format sizes cannot turn unknown into unavailable or permission success', () => {
+  for (const value of [undefined, null, '0', '4096', -1, 0.5, 0x80000000, NaN, Infinity, {}, []]) {
+    const song = structuredClone(fixture.publicSongs[0])
+    song.file.size_dolby = value
+    const option = windowsTrackPlaybackQualities(song).options.find(option => option.value === 'dolby')
+    assert.equal(option.availability, 'unknown')
+    assert.equal(Object.hasOwn(option, 'metadataSize'), false)
+    assert.equal(windowsSongMedia(song).sizes.dolby, null)
+  }
+  const song = structuredClone(fixture.publicSongs[0])
+  song.file.size_dolby = 0x7fffffff
+  assert.equal(windowsSongMedia(song).sizes.dolby, 0x7fffffff)
 })
 
 test('offset windows retain partial-page skip and require real server totals', () => {

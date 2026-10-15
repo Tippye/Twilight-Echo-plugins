@@ -1,5 +1,6 @@
 // Public Windows desktop search DTO observed in qq-windows-anonymous-song-dto-probe.json.
 // Native TrackInfo accepts UInt32 IDs. Persist both IDs in the SDK's retained string ID.
+import { WINDOWS_QUALITY_OPTIONS, windowsQualityCandidates, windowsQualityDefinition, windowsQualityMetadataSize } from './quality.mjs'
 const MID = { test: value => typeof value === 'string' && value.length === 14 && /^[a-zA-Z0-9]+$/.test(value) }
 const decimal = value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
   ? String(value) : typeof value === 'string' && value.length > 0 && !/[^0-9]/.test(value) ? value : null
@@ -73,11 +74,17 @@ export function windowsSongMedia(song) {
   }
   return { songmid: song.mid, songid: nativeId(song.id), mediaMid: song.file.media_mid,
     songtype: Number.isInteger(song.type) ? song.type : 0,
-    sizes: { mp3_128: count(song.file.size_128mp3), mp3_320: count(song.file.size_320mp3),
-      ogg_192: count(song.file.size_192ogg), flac: count(song.file.size_flac) },
+    sizes: { ...Object.fromEntries(WINDOWS_QUALITY_OPTIONS.map(option =>
+      [windowsQualityDefinition(option.value).sizeKey, windowsQualityMetadataSize(song.file, option.value)])),
+      ogg_192: count(song.file.size_192ogg) },
     title: text(song.name), singerName: Array.isArray(song.singer)
       ? song.singer.map(singer => text(singer?.name)).filter(Boolean).join('/') : '',
     albumName: text(song.album?.name), interval: count(song.interval) }
+}
+
+export function windowsTrackPlaybackQualities(song) {
+  const media = windowsSongMedia(song)
+  return { trackId: `qq:${media.songmid}:${media.songid}`, options: windowsQualityCandidates(song.file) }
 }
 
 /** Provider policy for SDK offset pagination, independent of native enum mapping. */

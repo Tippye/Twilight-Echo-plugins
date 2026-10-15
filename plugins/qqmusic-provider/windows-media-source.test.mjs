@@ -66,7 +66,9 @@ function deferred() { let resolve; const promise = new Promise(done => { resolve
 const tick = () => new Promise(resolve => setImmediate(resolve))
 function safeError(error, code) {
   assert.equal(error.name, 'WindowsPlaybackSourceError')
-  assert.equal(error.message, 'QQ 音乐播放源无法验证')
+  assert.equal(typeof error.message, 'string')
+  assert.match(error.message, /^(?:QQ 音乐|当前歌曲|请先使用手机 QQ)/)
+  assert.equal(/PRIVATE|PUBLIC_RAW_PROVIDER_MESSAGE|https?:\/\//.test(error.message), false)
   if (code !== undefined) assert.equal(error.code, code)
   return true
 }
@@ -152,6 +154,42 @@ test('explicit quality mappings preserve their native filename and encrypted ser
   for (const quality of ['unverified-ai', 'auto', 'custom', '', null, 960]) {
     assert.throws(() => harness(t, { quality }), error => safeError(error, 'QUALITY'))
   }
+})
+
+test('explicit absent formats fail before issuer or media requests while unknown metadata remains testable', async t => {
+  const blocked = harness(t)
+  assert.throws(() => createWindowsPlaybackResolver({ client: blocked.client, getDevice: () => device,
+    song: { ...song, sizes: { dolby: 0 } }, quality: 'dolby' }), error =>
+    safeError(error, 'QUALITY_UNAVAILABLE') && error.message === '当前歌曲未提供所选音质')
+  assert.equal(blocked.calls.length, 0)
+  assert.equal(blocked.requests.length, 0)
+  for (const sizes of [undefined, {}, { dolby: null }]) {
+    const h = harness(t, { song: { ...song, sizes }, quality: 'dolby', fetch: serving(encrypted(mp4()), []) })
+    const source = await h.resolver.resolve()
+    assert.equal(source.decoder.length, '2048')
+    assert.equal(h.calls.length, 1)
+    source.decoder.key.fill(0)
+  }
+})
+
+test('unavailable, empty issuer, service refusal, HTTP and content failures have distinct safe explanations', async t => {
+  const rejected = harness(t, { client: { request: async () => ({ retcode: 22, msg: 'PRIVATE_ACCOUNT_AND_TOKEN' }) } })
+  await assert.rejects(rejected.resolver.resolve(), error => safeError(error, 22) &&
+    error.message === 'QQ 音乐服务端拒绝所选音质（22）' && !/VIP|权限不足|未提供/.test(error.message))
+  const empty = harness(t, { client: { request: async (_key, call) => ({ retcode: 0, midurlinfo: [{
+    filename: call.param.filename[0], songmid: song.songmid, result: 0, purl: '' }] }) } })
+  await assert.rejects(empty.resolver.resolve(), error => safeError(error, 'VKEY_EMPTY') && /未返回.*播放地址/.test(error.message))
+  const http = harness(t, { fetch: async () => new Response(null, { status: 403 }) })
+  await assert.rejects(http.resolver.resolve(), error => safeError(error, 403) && error.message.includes('HTTP 403'))
+  const transport = harness(t, { fetch: async () => { throw Object.assign(Error('PRIVATE_URL_AND_TOKEN'), { code: 22 }) } })
+  await assert.rejects(transport.resolver.resolve(), error => safeError(error, 22) &&
+    error.message === 'QQ 音乐播放源请求失败（22）' && !/HTTP|服务端拒绝/.test(error.message))
+  const header = harness(t, { fetch: serving(Buffer.alloc(2048), []) })
+  await assert.rejects(header.resolver.resolve(), error => safeError(error, 'HEADER') && /格式或解密/.test(error.message))
+  const key = harness(t, { quality: 'flac', fetch: serving(encrypted(flac()), []),
+    client: { request: async (_key, call) => ({ retcode: 0, midurlinfo: [{ filename: call.param.filename[0],
+      songmid: song.songmid, result: 0, purl: '/public-media', ekey: 'PRIVATE_BAD_KEY' }] }) } })
+  await assert.rejects(key.resolver.resolve(), error => safeError(error, 'KEY') && /格式或解密/.test(error.message))
 })
 
 test('modern key validates the decoded FLAC header and verified footer trim', async t => {
@@ -310,7 +348,7 @@ test('failed remote login, network errors and missing keys cannot use cached aut
   const missing = harness(t, { quality: 'lossless', fetch: serving(encrypted(flac()), []),
     client: { request: async (_key, call) => ({ retcode: 0, sip: [origin], midurlinfo: [{ filename: call.param.filename[0],
       songmid: song.songmid, result: 0, purl: '/public-media' }] }) } })
-  await assert.rejects(missing.resolver.resolve(), error => safeError(error, 'SOURCE'))
+  await assert.rejects(missing.resolver.resolve(), error => safeError(error, 'KEY'))
 })
 
 test('abort/dispose cancel pending preflight and release a late body; disposed resolver stays closed', async t => {
@@ -427,6 +465,8 @@ test('resolver integrates with the real loopback proxy and excludes encrypted fo
   t.after(() => proxy.close())
   const lease = await proxy.open({ resolve: h.resolver.resolve })
   assert.match(lease.url, /^http:\/\/127\.0\.0\.1:\d+\/audio\/[a-f0-9]{48}$/)
+  assert.equal(lease.bytes, plain.length)
+  assert.notEqual(lease.bytes, payload.length)
   const response = await new Promise((resolve, reject) => {
     const req = request(lease.url, { headers: { Range: 'bytes=0-41' } }, res => {
       const chunks = []

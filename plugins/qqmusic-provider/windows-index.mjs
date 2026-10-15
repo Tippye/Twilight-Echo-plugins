@@ -2,7 +2,7 @@ import { hostname, release } from 'node:os'
 import { randomBytes, randomInt } from 'node:crypto'
 import { WindowsMusicClient } from './lib/windows/client.mjs'
 import { buildWindowsDesktopSearchCall, WINDOWS_DESKTOP_SEARCH_REQUEST_KEY } from './lib/windows/search-call.mjs'
-import { mapWindowsTrack, windowsSearchPage, windowsSearchWindow, windowsSongReference, windowsSongMedia } from './lib/windows/tracks.mjs'
+import { mapWindowsTrack, windowsSearchPage, windowsSearchWindow, windowsSongReference, windowsSongMedia, windowsTrackPlaybackQualities } from './lib/windows/tracks.mjs'
 import { buildWindowsTrackInfoCall, WINDOWS_TRACK_INFO_REQUEST_KEY } from './lib/windows/song-detail-call.mjs'
 import { createWindowsPlaybackResolver, WINDOWS_MEDIA_ALLOWED_ORIGINS } from './lib/windows/media-source.mjs'
 import { WindowsAudioProxy } from './lib/windows/audio-proxy.mjs'
@@ -65,6 +65,8 @@ export async function activate(context) {
     searchSongs: handler(searchSongs), checkLogin: handler(checkLogin), getProfile: handler(getProfile),
     logout: handler(logout), getQrLogin: handler(getQrLogin), checkQrLogin: handler(checkQrLogin),
     getPlaybackUrl: handler(getPlaybackUrl), getLyrics: handler(getLyrics),
+    getTrackPlaybackQualities: handler((s, args, invocation) => withVerifiedDataRead(s, invocation,
+      async signal => windowsTrackPlaybackQualities(await getSong(s, args[0], signal, { refresh: true })))),
     getPlaybackQuality: handler((s, _args, invocation) => windowsQualityState(s.settings,
       { guard: qualityGuard(invocation) })),
     setPlaybackQuality: handler((s, args, invocation) => setWindowsPlaybackQuality(s.settings, args[0],
@@ -219,10 +221,10 @@ async function searchSongs(state, args, invocation) {
   return { items: result, total }
 }
 
-async function getSong(state, track, signal) {
+async function getSong(state, track, signal, { refresh = false } = {}) {
   const reference = windowsSongReference(track)
   const cached = state.songs.get(reference.songmid)
-  if (cached && Date.now() - cached.at < 300000) {
+  if (!refresh && cached && Date.now() - cached.at < 300000) {
     try { if (windowsSongMedia(cached.song).songid === reference.songid) return cached.song } catch {}
     state.songs.delete(reference.songmid)
   }
@@ -373,9 +375,11 @@ async function getPlaybackUrl(state, args, invocation) {
   const epoch = state.playbackEpoch
   const signal = invocation?.signal
   if (!await state.client.checkLogin({ signal })) throw new Error('请先使用手机 QQ 扫码登录')
-  const song = windowsSongMedia(await getSong(state, args[0], signal))
   const options = args[1] ?? {}
   if (typeof options !== 'object' || options === null || Array.isArray(options)) throw new Error('QQ 音乐音质参数无效')
+  // Search/list metadata may be partial. Resolve an exact current TrackInfo row
+  // before treating a zero size as a missing format, including direct API calls.
+  const song = windowsSongMedia(await getSong(state, args[0], signal, { refresh: true }))
   const resolver = createWindowsPlaybackResolver({ client: state.client, getDevice: () => getDevice(state),
     song, quality: options.quality ?? await windowsPlaybackQuality(state.settings) })
   let lease
@@ -400,16 +404,13 @@ async function getPlaybackUrl(state, args, invocation) {
       previous.resolver.dispose()
       await previous.lease.release()
     }
-    return lease.url
+    return { streamUrl: lease.url, providerSource: { ...(lease.bytes === undefined ? {} : { bytes: lease.bytes }), expiresAt: lease.expiresAt } }
   } catch (error) {
     resolver.dispose()
     await lease?.release()
     if (error?.name === 'WindowsPlaybackSourceError') {
       const code = typeof error.code === 'number' || /^[A-Z_]{1,32}$/.test(error.code ?? '') ? error.code : 'SOURCE'
       state.context.logger?.warn?.(`QQ playback source validation: ${code}`)
-    }
-    if (error?.name === 'WindowsPlaybackSourceError' && Number.isSafeInteger(error.code)) {
-      throw new Error(`QQ 音乐播放源验证失败（${error.code}）`)
     }
     throw error
   }

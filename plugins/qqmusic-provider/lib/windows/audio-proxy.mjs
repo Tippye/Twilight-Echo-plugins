@@ -319,7 +319,10 @@ export class WindowsAudioProxy {
       lease.timer.unref?.()
       this.#leases.set(path, lease)
       parent.signal.addEventListener('abort', () => this.#revoke(lease), { once: true })
+      // Internal Range offsets remain uint64. Omit public byte metadata when it
+      // cannot be represented exactly, rather than narrowing the stream support.
       return { url: `http://127.0.0.1:${port}${path}`, expiresAt: lease.expiresAt,
+        ...(lease.length <= BigInt(Number.MAX_SAFE_INTEGER) ? { bytes: Number(lease.length) } : {}),
         release: () => this.#revoke(lease) }
     } catch (error) {
       parent.abort()

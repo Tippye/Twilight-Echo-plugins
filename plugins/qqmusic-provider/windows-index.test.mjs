@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { activate, deactivate } from './windows-index.mjs'
+import { WindowsMediaStream } from './lib/windows/media-stream.mjs'
 
 const fixture = JSON.parse(readFileSync(new URL('./test/fixtures/windows-public-search-songs.json', import.meta.url)))
 const session = { openid: 'public-openid', access_token: 'public-access', refresh_token: 'public-refresh',
@@ -302,13 +303,151 @@ test('persisted dual IDs resolve native scene0 details and play through a revoca
   h.storage.set('windows-auth', session)
   try {
     await activate(h.context)
-    const url = await h.provider.getPlaybackUrl({ id: 'qq:0039MnYb0qxYhV:97773' }, { quality: '128' }, {})
+    const result = await h.provider.getPlaybackUrl({ id: 'qq:0039MnYb0qxYhV:97773' }, { quality: '128' }, {})
+    const url = result.streamUrl
     assert.match(url, /^http:\/\/127\.0\.0\.1:\d+\/audio\/[a-f0-9]{48}$/)
+    assert.equal(result.providerSource.bytes, audio.length)
+    assert.equal(Number.isSafeInteger(result.providerSource.expiresAt), true)
+    assert.deepEqual(Object.keys(result.providerSource).sort(), ['bytes', 'expiresAt'])
+    assert.equal(JSON.stringify(result).includes('vkey'), false)
     assert.equal(details, 1)
     const response = await original(url)
     assert.deepEqual(Buffer.from(await response.arrayBuffer()), audio)
     await h.provider.logout({})
     assert.equal((await original(url)).status, 404)
+  } finally { await deactivate(); globalThis.fetch = original }
+})
+
+test('per-track qualities use fresh exact scene0 details and do not alter the global preference', { skip: process.platform !== 'win32' }, async () => {
+  const original = globalThis.fetch
+  let details = 0
+  const h = harness({ onRequest: (request, key) => {
+    let data = session
+    if (key === 'music.search.SearchCgiService') data = { meta: fixture.meta, body: { song: { list: fixture.publicSongs } } }
+    if (key === 'Protocol_UpdateSongInfo') {
+      assert.deepEqual(request[key].param, { ids: [97773], types: [0], ctx: 0, scene: 0 })
+      const song = structuredClone(fixture.publicSongs[0])
+      Object.assign(song.file, { size_dolby: ++details * 1000, size_hires: 0 })
+      delete song.file.size_dts
+      data = { tracks: [{ ...song, id: 123 }, { ...song, mid: '004Fs2FP1EvZYc' }, song] }
+    }
+    return new Response(JSON.stringify({ code: 0, [key]: { code: 0, data } }))
+  } })
+  globalThis.fetch = h.fetch
+  h.storage.set('windows-auth', session)
+  h.storage.set('windows-playback-quality', 'surround')
+  try {
+    await activate(h.context)
+    const { items } = await h.provider.searchSongs('晴天', 2, 0, {})
+    for (const bytes of [1000, 2000]) {
+      const result = await h.provider.getTrackPlaybackQualities(items[0], {})
+      assert.equal(result.trackId, items[0].id)
+      assert.equal(result.options.find(option => option.value === 'dolby').metadataSize, bytes)
+      assert.equal(result.options.find(option => option.value === 'hires').availability, 'unavailable')
+      assert.equal(result.options.find(option => option.value === 'surround').availability, 'unknown')
+      assert.equal(h.storage.get('windows-playback-quality'), 'surround')
+    }
+    assert.equal(details, 2)
+  } finally { await deactivate(); globalThis.fetch = original }
+})
+
+test('per-track quality queries reject canceled or revoked account responses without publishing stale options', { skip: process.platform !== 'win32' }, async () => {
+  const original = globalThis.fetch
+  for (const action of ['abort', 'logout', 'deactivate']) {
+    let release, announce
+    const held = new Promise(resolve => { release = resolve })
+    const started = new Promise(resolve => { announce = resolve })
+    const h = harness({ onRequest: async (_request, key) => {
+      if (key === 'Protocol_UpdateSongInfo') {
+        announce()
+        await held
+        return new Response(JSON.stringify({ code: 0, [key]: { code: 0, data: { tracks: fixture.publicSongs } } }))
+      }
+      return new Response(JSON.stringify({ code: 0, [key]: { code: 0, data: session } }))
+    } })
+    globalThis.fetch = h.fetch
+    h.storage.set('windows-auth', session)
+    try {
+      await activate(h.context)
+      const controller = new AbortController()
+      const pending = h.provider.getTrackPlaybackQualities({ id: 'qq:0039MnYb0qxYhV:97773' }, { signal: controller.signal })
+      const rejected = assert.rejects(pending, /取消|停用|登录/)
+      await started
+      if (action === 'abort') controller.abort()
+      else if (action === 'logout') await h.provider.logout({})
+      else await deactivate()
+      release()
+      await rejected
+    } finally { release(); await deactivate(); globalThis.fetch = original }
+  }
+})
+
+test('per-track qualities reject an unrelated detail and explicit absent media never reaches Vkey', { skip: process.platform !== 'win32' }, async () => {
+  const original = globalThis.fetch
+  let invalid = true
+  let issuers = 0
+  const h = harness({ onRequest: (_request, key) => {
+    let data = session
+    if (key === 'Protocol_UpdateSongInfo') {
+      const song = structuredClone(fixture.publicSongs[0])
+      song.file.size_dolby = 0
+      data = { tracks: invalid ? [{ ...song, id: 123 }, { ...song, mid: '004Fs2FP1EvZYc' }] : [song] }
+    }
+    if (key === 'queryvkey') { issuers++; throw Error('PRIVATE_ISSUER_SHOULD_NOT_RUN') }
+    return new Response(JSON.stringify({ code: 0, [key]: { code: 0, data } }))
+  } })
+  globalThis.fetch = h.fetch
+  h.storage.set('windows-auth', session)
+  try {
+    await activate(h.context)
+    const track = { id: 'qq:0039MnYb0qxYhV:97773' }
+    await assert.rejects(h.provider.getTrackPlaybackQualities(track, {}), /歌曲详情无效/)
+    invalid = false
+    await assert.rejects(h.provider.getPlaybackUrl(track, { quality: 'dolby' }, {}), /当前歌曲未提供所选音质/)
+    assert.equal(issuers, 0)
+  } finally { await deactivate(); globalThis.fetch = original }
+})
+
+test('normal encrypted playback envelope reports decrypted bytes after footer removal without leaking upstream identity', { skip: process.platform !== 'win32' }, async () => {
+  const original = globalThis.fetch
+  const vectors = JSON.parse(readFileSync(new URL('./test/fixtures/windows-ekey-native-v1.json', import.meta.url))).vectors
+  const vector = vectors.find(value => value.key_length > 300) ?? vectors[0]
+  const encoded = Buffer.from(vector.encoded_ekey_hex, 'hex').toString('ascii')
+  const audio = Buffer.alloc(2048, 7)
+  audio.write('fLaC'); audio[4] = 0; audio.writeUIntBE(34, 5, 3)
+  const transformer = new WindowsMediaStream(Buffer.from(vector.internal_key_hex, 'hex'))
+  const cipher = transformer.transform(Buffer.from(audio), '0')
+  transformer.dispose()
+  const footer = Buffer.concat([Buffer.from(encoded), Buffer.alloc(4)])
+  footer.writeUInt32LE(encoded.length, footer.length - 4)
+  const upstream = Buffer.concat([cipher, footer])
+  const h = harness({ onRequest: (request, key) => {
+    let data = session
+    if (key === 'Protocol_UpdateSongInfo') data = { tracks: fixture.publicSongs }
+    if (key === 'queryvkey') {
+      assert.equal(request[key].module, 'music.vkey.GetEVkey')
+      data = { retcode: 0, midurlinfo: [{ result: 0, songmid: fixture.publicSongs[0].mid,
+        filename: request[key].param.filename[0], purl: '/public-cipher?vkey=PUBLIC_SYNTHETIC_KEY', ekey: encoded }] }
+    }
+    return new Response(JSON.stringify({ code: 0, [key]: { code: 0, data } }))
+  }, mediaFetch: async (_url, options) => {
+    if (options.method === 'HEAD') return new Response(null, { headers: { 'Content-Length': String(upstream.length) } })
+    const match = /^bytes=(\d+)-(\d+)$/.exec(options.headers.Range)
+    const first = Number(match[1]), last = Number(match[2])
+    return new Response(upstream.subarray(first, last + 1), { status: 206,
+      headers: { 'Content-Length': String(last - first + 1), 'Content-Range': `bytes ${first}-${last}/${upstream.length}` } })
+  } })
+  globalThis.fetch = h.fetch
+  h.storage.set('windows-auth', session)
+  try {
+    await activate(h.context)
+    const result = await h.provider.getPlaybackUrl({ id: 'qq:0039MnYb0qxYhV:97773' }, { quality: 'flac' }, {})
+    assert.equal(result.providerSource.bytes, audio.length)
+    assert.notEqual(result.providerSource.bytes, upstream.length)
+    assert.deepEqual(Object.keys(result.providerSource).sort(), ['bytes', 'expiresAt'])
+    assert.equal(/PUBLIC_SYNTHETIC_KEY|stream.qqmusic|ekey|originSource/.test(JSON.stringify(result)), false)
+    const response = await original(result.streamUrl)
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), audio)
   } finally { await deactivate(); globalThis.fetch = original }
 })
 
@@ -394,7 +533,7 @@ test('a CDN status is reported as source validation failure without inventing ac
   try {
     await activate(h.context)
     await assert.rejects(h.provider.getPlaybackUrl({ id: 'qq:0039MnYb0qxYhV:97773' }, {}, {}),
-      error => error.message === 'QQ 音乐播放源验证失败（404）')
+      error => error.message === 'QQ 音乐音频请求失败（HTTP 404）')
   } finally { await deactivate(); globalThis.fetch = original }
 })
 

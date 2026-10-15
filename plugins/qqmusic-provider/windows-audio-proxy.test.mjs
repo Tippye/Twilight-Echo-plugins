@@ -64,6 +64,7 @@ test('loopback leases use opaque paths and expose logical bytes, GET, HEAD and b
   let resolutions = 0
   const lease = await proxy.open({ resolve: () => { resolutions += 1; return source() } })
   assert.match(lease.url, /^http:\/\/127\.0\.0\.1:\d+\/audio\/[a-f0-9]{48}$/)
+  assert.equal(lease.bytes, plain.length)
   assert.equal(lease.url.includes('vkey'), false)
   const full = await rawRequest(lease.url)
   assert.equal(full.status, 200)
@@ -128,6 +129,7 @@ test('mode2 Range uses exact uint64 offsets and original native oracle bytes, wi
     return source({ upstreamLength: total.toString(), decoder: { kind: 'mode2', key,
       length: logical.toString(), tailBytes: '3' } })
   } })
+  assert.equal(Object.hasOwn(lease, 'bytes'), false)
   const result = await rawRequest(lease.url, { headers: { Range: `bytes=${start}-${start + 7n}` } })
   assert.equal(result.status, 206)
   assert.equal(result.headers['content-range'], `bytes ${start}-${start + 7n}/${logical}`)
